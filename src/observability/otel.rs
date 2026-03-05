@@ -5,6 +5,7 @@ use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use std::any::Any;
 use std::time::SystemTime;
 
 /// OpenTelemetry-backed observer — exports traces and metrics via OTLP.
@@ -15,9 +16,12 @@ pub struct OtelObserver {
     // Metrics instruments
     agent_starts: Counter<u64>,
     agent_duration: Histogram<f64>,
+    llm_calls: Counter<u64>,
+    llm_duration: Histogram<f64>,
     tool_calls: Counter<u64>,
     tool_duration: Histogram<f64>,
     channel_messages: Counter<u64>,
+    webhook_auth_failures: Counter<u64>,
     heartbeat_ticks: Counter<u64>,
     errors: Counter<u64>,
     request_latency: Histogram<f64>,
@@ -32,13 +36,15 @@ impl OtelObserver {
     /// Uses HTTP/protobuf transport (port 4318 by default).
     /// Falls back to `http://localhost:4318` if no endpoint is provided.
     pub fn new(endpoint: Option<&str>, service_name: Option<&str>) -> Result<Self, String> {
-        let endpoint = endpoint.unwrap_or("http://localhost:4318");
+        let base_endpoint = endpoint.unwrap_or("http://localhost:4318");
+        let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
+        let metrics_endpoint = format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
         let service_name = service_name.unwrap_or("zeroclaw");
 
         // ── Trace exporter ──────────────────────────────────────
         let span_exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
-            .with_endpoint(endpoint)
+            .with_endpoint(&traces_endpoint)
             .build()
             .map_err(|e| format!("Failed to create OTLP span exporter: {e}"))?;
 
@@ -56,7 +62,7 @@ impl OtelObserver {
         // ── Metric exporter ─────────────────────────────────────
         let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
             .with_http()
-            .with_endpoint(endpoint)
+            .with_endpoint(&metrics_endpoint)
             .build()
             .map_err(|e| format!("Failed to create OTLP metric exporter: {e}"))?;
 
@@ -89,6 +95,17 @@ impl OtelObserver {
             .with_unit("s")
             .build();
 
+        let llm_calls = meter
+            .u64_counter("zeroclaw.llm.calls")
+            .with_description("Total LLM provider calls")
+            .build();
+
+        let llm_duration = meter
+            .f64_histogram("zeroclaw.llm.duration")
+            .with_description("LLM provider call duration in seconds")
+            .with_unit("s")
+            .build();
+
         let tool_calls = meter
             .u64_counter("zeroclaw.tool.calls")
             .with_description("Total tool calls")
@@ -103,6 +120,11 @@ impl OtelObserver {
         let channel_messages = meter
             .u64_counter("zeroclaw.channel.messages")
             .with_description("Total channel messages")
+            .build();
+
+        let webhook_auth_failures = meter
+            .u64_counter("zeroclaw.webhook.auth.failures")
+            .with_description("Total webhook authentication failures")
             .build();
 
         let heartbeat_ticks = meter
@@ -141,9 +163,12 @@ impl OtelObserver {
             meter_provider: meter_provider_clone,
             agent_starts,
             agent_duration,
+            llm_calls,
+            llm_duration,
             tool_calls,
             tool_duration,
             channel_messages,
+            webhook_auth_failures,
             heartbeat_ticks,
             errors,
             request_latency,
@@ -168,9 +193,55 @@ impl Observer for OtelObserver {
                     ],
                 );
             }
+            ObserverEvent::LlmRequest { .. }
+            | ObserverEvent::ToolCallStart { .. }
+            | ObserverEvent::TurnComplete => {}
+            ObserverEvent::LlmResponse {
+                provider,
+                model,
+                duration,
+                success,
+                error_message: _,
+                input_tokens: _,
+                output_tokens: _,
+            } => {
+                let secs = duration.as_secs_f64();
+                let attrs = [
+                    KeyValue::new("provider", provider.clone()),
+                    KeyValue::new("model", model.clone()),
+                    KeyValue::new("success", success.to_string()),
+                ];
+                self.llm_calls.add(1, &attrs);
+                self.llm_duration.record(secs, &attrs);
+
+                // Create a completed span for visibility in trace backends.
+                let start_time = SystemTime::now()
+                    .checked_sub(*duration)
+                    .unwrap_or(SystemTime::now());
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("llm.call")
+                        .with_kind(SpanKind::Internal)
+                        .with_start_time(start_time)
+                        .with_attributes(vec![
+                            KeyValue::new("provider", provider.clone()),
+                            KeyValue::new("model", model.clone()),
+                            KeyValue::new("success", *success),
+                            KeyValue::new("duration_s", secs),
+                        ]),
+                );
+                if *success {
+                    span.set_status(Status::Ok);
+                } else {
+                    span.set_status(Status::error(""));
+                }
+                span.end();
+            }
             ObserverEvent::AgentEnd {
+                provider,
+                model,
                 duration,
                 tokens_used,
+                cost_usd,
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -182,14 +253,27 @@ impl Observer for OtelObserver {
                     opentelemetry::trace::SpanBuilder::from_name("agent.invocation")
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
-                        .with_attributes(vec![KeyValue::new("duration_s", secs)]),
+                        .with_attributes(vec![
+                            KeyValue::new("provider", provider.clone()),
+                            KeyValue::new("model", model.clone()),
+                            KeyValue::new("duration_s", secs),
+                        ]),
                 );
                 if let Some(t) = tokens_used {
                     span.set_attribute(KeyValue::new("tokens_used", *t as i64));
                 }
+                if let Some(c) = cost_usd {
+                    span.set_attribute(KeyValue::new("cost_usd", *c));
+                }
                 span.end();
 
-                self.agent_duration.record(secs, &[]);
+                self.agent_duration.record(
+                    secs,
+                    &[
+                        KeyValue::new("provider", provider.clone()),
+                        KeyValue::new("model", model.clone()),
+                    ],
+                );
                 // Note: tokens are recorded via record_metric(TokensUsed) to avoid
                 // double-counting. AgentEnd only records duration.
             }
@@ -236,6 +320,20 @@ impl Observer for OtelObserver {
                     &[
                         KeyValue::new("channel", channel.clone()),
                         KeyValue::new("direction", direction.clone()),
+                    ],
+                );
+            }
+            ObserverEvent::WebhookAuthFailure {
+                channel,
+                signature,
+                bearer,
+            } => {
+                self.webhook_auth_failures.add(
+                    1,
+                    &[
+                        KeyValue::new("channel", channel.clone()),
+                        KeyValue::new("signature", signature.clone()),
+                        KeyValue::new("bearer", bearer.clone()),
                     ],
                 );
             }
@@ -290,6 +388,10 @@ impl Observer for OtelObserver {
     fn name(&self) -> &str {
         "otel"
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 #[cfg(test)]
@@ -323,13 +425,36 @@ mod tests {
             provider: "openrouter".into(),
             model: "claude-sonnet".into(),
         });
-        obs.record_event(&ObserverEvent::AgentEnd {
-            duration: Duration::from_millis(500),
-            tokens_used: Some(100),
+        obs.record_event(&ObserverEvent::LlmRequest {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            messages_count: 2,
+        });
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(250),
+            success: true,
+            error_message: None,
+            input_tokens: Some(100),
+            output_tokens: Some(50),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(500),
+            tokens_used: Some(100),
+            cost_usd: Some(0.0015),
+        });
+        obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
             duration: Duration::ZERO,
             tokens_used: None,
+            cost_usd: None,
+        });
+        obs.record_event(&ObserverEvent::ToolCallStart {
+            tool: "shell".into(),
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
@@ -341,6 +466,7 @@ mod tests {
             duration: Duration::from_millis(5),
             success: false,
         });
+        obs.record_event(&ObserverEvent::TurnComplete);
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),
             direction: "inbound".into(),
@@ -367,5 +493,59 @@ mod tests {
         let obs = test_observer();
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.flush();
+    }
+
+    // ── §8.2 OTel export failure resilience tests ────────────
+
+    #[test]
+    fn otel_records_error_event_without_panic() {
+        let obs = test_observer();
+        // Simulate an error event — should not panic even with unreachable endpoint
+        obs.record_event(&ObserverEvent::Error {
+            component: "provider".into(),
+            message: "connection refused to model endpoint".into(),
+        });
+    }
+
+    #[test]
+    fn otel_records_llm_failure_without_panic() {
+        let obs = test_observer();
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "openrouter".into(),
+            model: "missing-model".into(),
+            duration: Duration::from_millis(0),
+            success: false,
+            error_message: Some("404 Not Found".into()),
+            input_tokens: None,
+            output_tokens: None,
+        });
+    }
+
+    #[test]
+    fn otel_flush_idempotent_with_unreachable_endpoint() {
+        let obs = test_observer();
+        // Multiple flushes should not panic even when endpoint is unreachable
+        obs.flush();
+        obs.flush();
+        obs.flush();
+    }
+
+    #[test]
+    fn otel_records_zero_duration_metrics() {
+        let obs = test_observer();
+        obs.record_metric(&ObserverMetric::RequestLatency(Duration::ZERO));
+        obs.record_metric(&ObserverMetric::TokensUsed(0));
+        obs.record_metric(&ObserverMetric::ActiveSessions(0));
+        obs.record_metric(&ObserverMetric::QueueDepth(0));
+    }
+
+    #[test]
+    fn otel_observer_creation_with_valid_endpoint_succeeds() {
+        // Even though endpoint is unreachable, creation should succeed
+        let result = OtelObserver::new(Some("http://127.0.0.1:12345"), Some("zeroclaw-test"));
+        assert!(
+            result.is_ok(),
+            "observer creation must succeed even with unreachable endpoint"
+        );
     }
 }

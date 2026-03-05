@@ -306,6 +306,8 @@ fn prune_conversation_rows(workspace_dir: &Path, retention_days: u32) -> Result<
     }
 
     let conn = Connection::open(db_path)?;
+    // Use WAL so hygiene pruning doesn't block agent reads
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
     let cutoff = (Local::now() - Duration::days(i64::from(retention_days))).to_rfc3339();
 
     let affected = conn.execute(
@@ -322,11 +324,10 @@ fn memory_date_from_filename(filename: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(date_part, "%Y-%m-%d").ok()
 }
 
+#[allow(clippy::incompatible_msrv)]
 fn date_prefix(filename: &str) -> Option<NaiveDate> {
-    if filename.len() < 10 {
-        return None;
-    }
-    NaiveDate::parse_from_str(&filename[..filename.floor_char_boundary(10)], "%Y-%m-%d").ok()
+    let prefix = filename.get(..10)?;
+    NaiveDate::parse_from_str(prefix, "%Y-%m-%d").ok()
 }
 
 fn is_older_than(path: &Path, cutoff: SystemTime) -> bool {
@@ -500,10 +501,10 @@ mod tests {
         let workspace = tmp.path();
 
         let mem = SqliteMemory::new(workspace).unwrap();
-        mem.store("conv_old", "outdated", MemoryCategory::Conversation)
+        mem.store("conv_old", "outdated", MemoryCategory::Conversation, None)
             .await
             .unwrap();
-        mem.store("core_keep", "durable", MemoryCategory::Core)
+        mem.store("core_keep", "durable", MemoryCategory::Core, None)
             .await
             .unwrap();
         drop(mem);
